@@ -11,6 +11,13 @@ use core::cmp::min;
 
 pub use backend::net::send_recv::{RecvFlags, ReturnFlags, SendFlags};
 
+#[cfg(target_os = "linux")]
+mod pidfd;
+#[cfg(target_os = "linux")]
+pub(crate) use pidfd::KernelPidfdControl;
+#[cfg(target_os = "linux")]
+pub use pidfd::*;
+
 #[cfg(not(any(
     windows,
     target_os = "espidf",

@@ -6,6 +6,11 @@
 // things below.
 pub(crate) use libc::*;
 
+/// Linux SCM_PIDFD ABI, absent from the declared libc 0.2.182 minimum.
+/// https://github.com/torvalds/linux/blob/028ef9c96e96197026887c0f092424679298aae8/include/linux/socket.h#L196
+#[cfg(all(target_os = "linux", feature = "net"))]
+pub(crate) const SCM_PIDFD: c_int = 0x04;
+
 /// `PROC_SUPER_MAGIC`—The magic number for the procfs filesystem.
 #[cfg(all(linux_kernel, target_env = "musl"))]
 pub(crate) const PROC_SUPER_MAGIC: u32 = 0x0000_9fa0;

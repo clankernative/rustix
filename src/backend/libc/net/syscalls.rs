@@ -432,3 +432,25 @@ pub(crate) fn socketpair(
         Ok((fd0, fd1))
     }
 }
+
+#[cfg(target_os = "linux")]
+pub(crate) fn recvmsg_pidfd(
+    socket: BorrowedFd<'_>,
+    iov: &mut [IoSliceMut<'_>],
+    control: &mut crate::net::KernelPidfdControl,
+    flags: RecvFlags,
+) -> io::Result<(usize, ReturnFlags)> {
+    // SAFETY: All pointer/length pairs refer to live borrowed iov and private
+    // zeroed control storage. No caller pointers or old UCred parser intervene.
+    let (bytes, returned) = unsafe {
+        super::msghdr::with_recv_pidfd_msghdr(iov, control, |header| {
+            let bytes = ret_send_recv(c::recvmsg(
+                borrowed_fd(socket),
+                header,
+                bitflags_bits!(flags),
+            ))?;
+            Ok((bytes, header.msg_flags))
+        })?
+    };
+    Ok((bytes, ReturnFlags::from_bits_retain(bitcast!(returned))))
+}

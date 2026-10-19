@@ -729,3 +729,33 @@ pub(crate) fn listen(fd: BorrowedFd<'_>, backlog: c::c_int) -> io::Result<()> {
         ))
     }
 }
+
+#[cfg(target_os = "linux")]
+pub(crate) fn recvmsg_pidfd(
+    socket: BorrowedFd<'_>,
+    iov: &mut [IoSliceMut<'_>],
+    control: &mut crate::net::KernelPidfdControl,
+    flags: RecvFlags,
+) -> io::Result<(usize, ReturnFlags)> {
+    // SAFETY: All pointers refer to the live borrowed iov and private zeroed
+    // control storage. Successful recvmsg supplies initialized lengths and
+    // uniquely installed descriptors; syscall Err installs none here.
+    let (bytes, returned) = unsafe {
+        super::msghdr::with_recv_pidfd_msghdr(iov, control, |header| {
+            #[cfg(not(target_arch = "x86"))]
+            let result = ret_usize(syscall!(__NR_recvmsg, socket, by_mut(header), flags));
+            #[cfg(target_arch = "x86")]
+            let result = ret_usize(syscall!(
+                __NR_socketcall,
+                x86_sys(SYS_RECVMSG),
+                slice_just_addr::<ArgReg<'_, SocketArg>, _>(&[
+                    socket.into(),
+                    by_mut(header),
+                    flags.into(),
+                ])
+            ));
+            result.map(|bytes| (bytes, header.msg_flags))
+        })?
+    };
+    Ok((bytes, ReturnFlags::from_bits_retain(returned)))
+}
