@@ -54,6 +54,45 @@ pub struct ReceivedPidfdPacket {
     pub credentials: KernelCredentialsData,
 }
 
+/// The exact number of transferred descriptors admitted by the separate
+/// rights-bearing packet receiver. No unbounded or caller-buffer mode exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PidfdRightsCount {
+    /// Exactly one transferred descriptor.
+    One,
+    /// Exactly two transferred descriptors.
+    Two,
+}
+
+impl PidfdRightsCount {
+    fn count(self) -> usize {
+        match self {
+            Self::One => 1,
+            Self::Two => 2,
+        }
+    }
+}
+
+/// Uniquely owned transferred descriptors. Their type, creator, relationship,
+/// liveness and authority have not been checked by this mechanical receiver.
+pub enum ReceivedPidfdRights {
+    /// One transferred descriptor.
+    One(OwnedFd),
+    /// Two transferred descriptors, in the order supplied by the kernel.
+    Two([OwnedFd; 2]),
+}
+
+/// One kernel process packet and its separately transferred descriptors.
+///
+/// This is not sender/workload authentication. Explicit credentials can affect
+/// which process the PIDFD denotes; the rights may refer to unrelated objects.
+pub struct ReceivedPidfdRightsPacket {
+    /// The original owned process handle and checked integer credential DATA.
+    pub packet: ReceivedPidfdPacket,
+    /// The exact requested number of uniquely owned transferred descriptors.
+    pub rights: ReceivedPidfdRights,
+}
+
 /// Reception or strict ancillary validation failed. Validation errors may
 /// follow a consumed packet; they must not be treated as an unconsumed retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +126,9 @@ pub enum RecvPidfdError {
     MalformedCredentials,
     /// The received descriptor lacked close-on-exec.
     DescriptorNotCloexec,
+    /// The separate rights-bearing receiver required exactly one rights
+    /// message of the selected size. It was missing, duplicated or mismatched.
+    RightsCountMismatch,
 }
 
 impl fmt::Display for RecvPidfdError {
@@ -134,6 +176,48 @@ pub fn recv_pidfd_packet<Fd: AsFd>(
     )
     .map_err(RecvPidfdError::Io)?;
     decode_packet(bytes, flags, &mut control)
+}
+
+/// Receive one nonempty AF_UNIX SOCK_SEQPACKET packet with exactly one
+/// SCM_PIDFD, one SCM_CREDENTIALS and one SCM_RIGHTS message containing the
+/// selected one or two descriptors. All other ancillary messages refuse.
+///
+/// Unlike [`recv_pidfd_packet`], this separate API explicitly admits bounded
+/// rights. The strict receiver is unchanged and continues to refuse rights.
+/// This performs exactly one nonblocking receive, forces MSG_CMSG_CLOEXEC and
+/// MSG_DONTWAIT, never peeks and borrows rather than closes the socket. Enable
+/// SO_PASSCRED and SO_PASSPIDFD first. A refusal may follow a consumed packet;
+/// it is not an unconsumed retry indication.
+///
+/// Every recognized installed descriptor is owned before fallible validation
+/// and closed on refusal or early drop, including excess rights. Descriptor
+/// zero is valid; credential PID zero remains unavailable numeric DATA. Caller
+/// code must independently authenticate the forwarder and validate every
+/// transferred object's type, relationship and permitted use. Neither integer
+/// credentials nor a received PIDFD proves syscall writer, workload or role.
+pub fn recv_pidfd_rights_packet<Fd: AsFd>(
+    socket: Fd,
+    payload: &mut [IoSliceMut<'_>],
+    expected: PidfdRightsCount,
+) -> Result<ReceivedPidfdRightsPacket, RecvPidfdError> {
+    let socket = socket.as_fd();
+    if sockopt::socket_type(socket).map_err(RecvPidfdError::Io)? != SocketType::SEQPACKET
+        || sockopt::socket_domain(socket).map_err(RecvPidfdError::Io)? != AddressFamily::UNIX
+    {
+        return Err(RecvPidfdError::SocketProfile);
+    }
+    if !payload.iter().any(|slice| slice.len() != 0) {
+        return Err(RecvPidfdError::EmptyPayloadBuffer);
+    }
+    let mut control = KernelPidfdControl::new();
+    let (bytes, flags) = backend::net::syscalls::recvmsg_pidfd(
+        socket,
+        payload,
+        &mut control,
+        RecvFlags::DONTWAIT | RecvFlags::CMSG_CLOEXEC,
+    )
+    .map_err(RecvPidfdError::Io)?;
+    decode_rights_packet(bytes, flags, &mut control, expected)
 }
 
 // Linux SCM_MAX_FD rights, one PIDFD, and one credentials record. Unexpected
@@ -412,6 +496,158 @@ fn decode_packet(
         flags,
         process,
         credentials: identity,
+    })
+}
+
+// Uses only the existing private kernel-owned control guard. No caller bytes
+// or new unsafe parsing path is introduced. The old decoder is not relaxed.
+fn decode_rights_packet(
+    bytes: usize,
+    flags: ReturnFlags,
+    control: &mut KernelPidfdControl,
+    expected: PidfdRightsCount,
+) -> Result<ReceivedPidfdRightsPacket, RecvPidfdError> {
+    let mut issue = if flags.intersects(ReturnFlags::TRUNC | ReturnFlags::CTRUNC) {
+        Some(RecvPidfdError::Truncated)
+    } else if bytes == 0 {
+        Some(RecvPidfdError::ClosedOrEmptyPacket)
+    } else {
+        None
+    };
+    let mut cursor = 0;
+    let mut process = None;
+    let mut process_count = 0;
+    let mut identity = None;
+    let mut credentials_count = 0;
+    let mut rights_count = 0;
+    let mut rights = [None; 2];
+    loop {
+        let record = match control.record(cursor) {
+            Ok(Some(record)) => record,
+            Ok(None) => break,
+            Err(error) => {
+                issue.get_or_insert(error);
+                break;
+            }
+        };
+        cursor = record.next;
+        if record.level != SOL_SOCKET {
+            issue.get_or_insert(RecvPidfdError::UnexpectedAncillary);
+            continue;
+        }
+        match record.kind {
+            SCM_PIDFD => {
+                process_count += 1;
+                if process_count > 1 {
+                    issue.get_or_insert(RecvPidfdError::DuplicateProcess);
+                }
+                if record.length != size_of::<i32>() {
+                    issue.get_or_insert(RecvPidfdError::MalformedAncillary);
+                    continue;
+                }
+                let raw = control.integer(record.payload);
+                if raw >= 0 {
+                    process = Some(record.payload);
+                } else if let Some(errno) =
+                    raw.checked_neg().filter(|errno| (1..=4095).contains(errno))
+                {
+                    issue.get_or_insert(RecvPidfdError::SenderUnavailable(
+                        io::Errno::from_raw_os_error(errno),
+                    ));
+                } else {
+                    issue.get_or_insert(RecvPidfdError::MalformedAncillary);
+                }
+            }
+            SCM_CREDENTIALS => {
+                credentials_count += 1;
+                if credentials_count > 1 {
+                    issue.get_or_insert(RecvPidfdError::DuplicateCredentials);
+                }
+                if record.length != size_of::<RawUCred>() {
+                    issue.get_or_insert(RecvPidfdError::MalformedCredentials);
+                    continue;
+                }
+                // Linux ucred is three 32-bit integer fields. integer() reads
+                // byte arrays, without forming raw pointers or NonZero values.
+                let raw = RawUCred {
+                    pid: control.integer(record.payload),
+                    uid: control.integer(record.payload + 4) as u32,
+                    gid: control.integer(record.payload + 8) as u32,
+                };
+                match credentials(raw) {
+                    Ok(value) => identity = Some(value),
+                    Err(error) => {
+                        issue.get_or_insert(error);
+                    }
+                }
+            }
+            SCM_RIGHTS => {
+                rights_count += 1;
+                if rights_count > 1 || record.length != expected.count() * size_of::<i32>() {
+                    issue.get_or_insert(RecvPidfdError::RightsCountMismatch);
+                    continue;
+                }
+                for (index, slot) in rights.iter_mut().enumerate().take(expected.count()) {
+                    let offset = record.payload + index * size_of::<i32>();
+                    if control.integer(offset) < 0 {
+                        issue.get_or_insert(RecvPidfdError::MalformedAncillary);
+                    } else {
+                        *slot = Some(offset);
+                    }
+                }
+            }
+            _ => {
+                issue.get_or_insert(RecvPidfdError::UnexpectedAncillary);
+            }
+        }
+    }
+    if let Some(error) = issue {
+        return Err(error);
+    }
+    let process = process.ok_or(RecvPidfdError::MissingProcess)?;
+    let identity = identity.ok_or(RecvPidfdError::MissingCredentials)?;
+    let first = rights[0].ok_or(RecvPidfdError::RightsCountMismatch)?;
+    if rights_count != 1 {
+        return Err(RecvPidfdError::RightsCountMismatch);
+    }
+    let second = match expected {
+        PidfdRightsCount::One => None,
+        PidfdRightsCount::Two => Some(rights[1].ok_or(RecvPidfdError::RightsCountMismatch)?),
+    };
+    let process = control.take_descriptor(process);
+    if !io::fcntl_getfd(&process)
+        .map_err(RecvPidfdError::Io)?
+        .contains(io::FdFlags::CLOEXEC)
+    {
+        return Err(RecvPidfdError::DescriptorNotCloexec);
+    }
+    let rights = match second {
+        None => ReceivedPidfdRights::One(control.take_descriptor(first)),
+        Some(second) => ReceivedPidfdRights::Two([
+            control.take_descriptor(first),
+            control.take_descriptor(second),
+        ]),
+    };
+    let descriptors: &[OwnedFd] = match &rights {
+        ReceivedPidfdRights::One(fd) => core::slice::from_ref(fd),
+        ReceivedPidfdRights::Two(fds) => fds,
+    };
+    for descriptor in descriptors {
+        if !io::fcntl_getfd(descriptor)
+            .map_err(RecvPidfdError::Io)?
+            .contains(io::FdFlags::CLOEXEC)
+        {
+            return Err(RecvPidfdError::DescriptorNotCloexec);
+        }
+    }
+    Ok(ReceivedPidfdRightsPacket {
+        packet: ReceivedPidfdPacket {
+            bytes,
+            flags,
+            process,
+            credentials: identity,
+        },
+        rights,
     })
 }
 
@@ -1187,5 +1423,443 @@ mod tests {
             before,
             "repeated kernel receive/refusal leaked descriptors"
         );
+    }
+
+    mod rights {
+        use super::*;
+
+        fn owned_rights(control: &mut KernelPidfdControl, descriptors: Vec<OwnedFd>) {
+            let length = descriptors.len() * size_of::<i32>();
+            // SAFETY: Only bounded integer-length ABI space is computed.
+            let space = unsafe { c::CMSG_SPACE(length as _) } as usize;
+            assert!(control.initialized + space <= control.capacity());
+            let bytes = descriptors
+                .into_iter()
+                .flat_map(|fd| fd.into_raw_fd().to_ne_bytes())
+                .collect::<Vec<_>>();
+            // SAFETY: Every nonnegative descriptor in this complete record is
+            // uniquely transferred into the existing control guard.
+            unsafe { record(control, SCM_RIGHTS, &bytes) };
+        }
+
+        #[test]
+        fn synthetic_mixed_order_keeps_exact_owned_count_and_unavailable_pid() {
+            for expected in [PidfdRightsCount::One, PidfdRightsCount::Two] {
+                for order in [
+                    [0, 1, 2],
+                    [0, 2, 1],
+                    [1, 0, 2],
+                    [1, 2, 0],
+                    [2, 0, 1],
+                    [2, 1, 0],
+                ] {
+                    let (process, process_peer) = endpoint();
+                    let mut process = Some(process);
+                    let mut peers = vec![process_peer];
+                    let descriptors = (0..expected.count())
+                        .map(|_| {
+                            let (fd, peer) = endpoint();
+                            peers.push(peer);
+                            fd
+                        })
+                        .collect::<Vec<_>>();
+                    let mut descriptors = Some(descriptors);
+                    let mut control = KernelPidfdControl::new();
+                    for item in order {
+                        match item {
+                            0 => owned_record(&mut control, SCM_PIDFD, process.take().unwrap()),
+                            1 => credential_record(&mut control, 0),
+                            2 => owned_rights(&mut control, descriptors.take().unwrap()),
+                            _ => unreachable!(),
+                        }
+                    }
+                    let packet =
+                        decode_rights_packet(1, ReturnFlags::empty(), &mut control, expected)
+                            .unwrap();
+                    assert_eq!(
+                        packet.packet.credentials.process,
+                        KernelPidVisibility::NotVisible
+                    );
+                    let handles: &[OwnedFd] = match &packet.rights {
+                        ReceivedPidfdRights::One(fd) => core::slice::from_ref(fd),
+                        ReceivedPidfdRights::Two(fds) => fds,
+                    };
+                    assert_eq!(handles.len(), expected.count());
+                    assert!(handles
+                        .iter()
+                        .all(|fd| io::fcntl_getfd(fd).unwrap().contains(io::FdFlags::CLOEXEC)));
+                    drop(control);
+                    for peer in &mut peers {
+                        assert_eq!(
+                            peer.read(&mut [0]).unwrap_err().kind(),
+                            std::io::ErrorKind::WouldBlock
+                        );
+                    }
+                    drop(packet);
+                    for peer in peers {
+                        closed(peer);
+                    }
+                }
+            }
+        }
+
+        fn synthetic_refusals_once() {
+            for case in 0..13 {
+                let (process, process_peer) = endpoint();
+                let mut peers = vec![process_peer];
+                let mut control = KernelPidfdControl::new();
+                if case == 12 {
+                    io::fcntl_setfd(&process, io::FdFlags::empty()).unwrap();
+                }
+                if case == 0 {
+                    drop(process);
+                } else {
+                    owned_record(&mut control, SCM_PIDFD, process);
+                }
+                if case != 1 {
+                    credential_record(&mut control, if case == 2 { -1 } else { 1 });
+                }
+                let count = if case == 3 {
+                    0
+                } else if case == 4 {
+                    1
+                } else if case == 5 {
+                    3
+                } else {
+                    2
+                };
+                let descriptors = (0..count)
+                    .map(|_| {
+                        let (fd, peer) = endpoint();
+                        peers.push(peer);
+                        if case == 6 {
+                            io::fcntl_setfd(&fd, io::FdFlags::empty()).unwrap();
+                        }
+                        fd
+                    })
+                    .collect::<Vec<_>>();
+                if count != 0 {
+                    owned_rights(&mut control, descriptors);
+                }
+                if case == 7 {
+                    let (extra, peer) = endpoint();
+                    peers.push(peer);
+                    owned_rights(&mut control, vec![extra]);
+                }
+                if case == 8 {
+                    credential_record(&mut control, 1);
+                }
+                if case == 9 {
+                    let (extra, peer) = endpoint();
+                    peers.push(peer);
+                    owned_record(&mut control, SCM_PIDFD, extra);
+                }
+                let flags = if case == 10 {
+                    ReturnFlags::TRUNC
+                } else if case == 11 {
+                    ReturnFlags::CTRUNC
+                } else {
+                    ReturnFlags::empty()
+                };
+                assert!(
+                    decode_rights_packet(1, flags, &mut control, PidfdRightsCount::Two).is_err(),
+                    "case {case}"
+                );
+                drop(control);
+                for peer in peers {
+                    closed(peer);
+                }
+            }
+            // Exact successful rights are still unadmitted on the ORIGINAL API.
+            let (process, peer) = endpoint();
+            let (right, right_peer) = endpoint();
+            let mut control = KernelPidfdControl::new();
+            owned_record(&mut control, SCM_PIDFD, process);
+            credential_record(&mut control, 1);
+            owned_rights(&mut control, vec![right]);
+            assert!(matches!(
+                decode_packet(1, ReturnFlags::empty(), &mut control),
+                Err(RecvPidfdError::UnexpectedAncillary)
+            ));
+            drop(control);
+            closed(peer);
+            closed(right_peer);
+        }
+
+        #[test]
+        fn synthetic_refusals_close_all_descriptors_and_strict_receiver_stays_strict() {
+            synthetic_refusals_once();
+        }
+
+        #[test]
+        fn malformed_rights_unknown_controls_and_empty_packets_refuse_and_close() {
+            for case in 0..3 {
+                let (process, peer) = endpoint();
+                let (right, right_peer) = endpoint();
+                let mut control = KernelPidfdControl::new();
+                owned_record(&mut control, SCM_PIDFD, process);
+                credential_record(&mut control, 1);
+                let raw = right.into_raw_fd();
+                let mut payload = raw.to_ne_bytes().to_vec();
+                if case == 0 {
+                    payload.push(0);
+                }
+                // SAFETY: The complete recognized FD is uniquely transferred;
+                // any trailing byte is malformed data, not another descriptor.
+                unsafe {
+                    record(&mut control, SCM_RIGHTS, &payload);
+                }
+                if case == 1 {
+                    // SAFETY: This unknown control carries no descriptor.
+                    unsafe {
+                        record(&mut control, 0x7fff, &[]);
+                    }
+                }
+                assert!(decode_rights_packet(
+                    if case == 2 { 0 } else { 1 },
+                    ReturnFlags::empty(),
+                    &mut control,
+                    PidfdRightsCount::One
+                )
+                .is_err());
+                drop(control);
+                closed(peer);
+                closed(right_peer);
+            }
+        }
+
+        fn send_many(sender: &OwnedFd, rights: &[OwnedFd], payload: &[u8]) {
+            let mut space = [MaybeUninit::uninit(); crate::cmsg_space!(ScmRights(3))];
+            let mut control = SendAncillaryBuffer::new(&mut space);
+            let borrowed = rights.iter().map(AsFd::as_fd).collect::<Vec<_>>();
+            assert!(control.push(SendAncillaryMessage::ScmRights(&borrowed)));
+            assert_eq!(
+                crate::net::sendmsg(
+                    sender,
+                    &[io::IoSlice::new(payload)],
+                    &mut control,
+                    SendFlags::empty()
+                )
+                .unwrap(),
+                payload.len()
+            );
+        }
+
+        #[test]
+        fn borrowed_socket_profile_and_empty_destination_refuse_without_closing_socket() {
+            let (stream, peer) = UnixStream::pair().unwrap();
+            let mut bytes = [0];
+            assert!(matches!(
+                recv_pidfd_rights_packet(
+                    &stream,
+                    &mut [IoSliceMut::new(&mut bytes)],
+                    PidfdRightsCount::One
+                ),
+                Err(RecvPidfdError::SocketProfile)
+            ));
+            assert_eq!(sockopt::socket_type(&stream).unwrap(), SocketType::STREAM);
+            drop(peer);
+            let (sender, receiver) = crate::net::socketpair(
+                AddressFamily::UNIX,
+                SocketType::SEQPACKET,
+                SocketFlags::CLOEXEC,
+                None,
+            )
+            .unwrap();
+            let mut empty = [];
+            assert!(matches!(
+                recv_pidfd_rights_packet(
+                    &receiver,
+                    &mut [IoSliceMut::new(&mut empty)],
+                    PidfdRightsCount::One
+                ),
+                Err(RecvPidfdError::EmptyPayloadBuffer)
+            ));
+            assert_eq!(
+                sockopt::socket_type(&sender).unwrap(),
+                SocketType::SEQPACKET
+            );
+            assert_eq!(
+                sockopt::socket_type(&receiver).unwrap(),
+                SocketType::SEQPACKET
+            );
+        }
+
+        fn kernel_once() {
+            for count in [PidfdRightsCount::One, PidfdRightsCount::Two] {
+                let (sender, receiver) = sockets().expect("capability changed after probe");
+                let mut byte = [0];
+                assert!(matches!(
+                    recv_pidfd_rights_packet(&receiver, &mut [IoSliceMut::new(&mut byte)], count),
+                    Err(RecvPidfdError::Io(io::Errno::AGAIN))
+                ));
+                let mut peers = Vec::new();
+                let rights = (0..count.count())
+                    .map(|_| {
+                        let (fd, peer) = endpoint();
+                        peers.push(peer);
+                        fd
+                    })
+                    .collect::<Vec<_>>();
+                send_many(&sender, &rights, b"x");
+                drop(rights);
+                let packet =
+                    recv_pidfd_rights_packet(&receiver, &mut [IoSliceMut::new(&mut byte)], count)
+                        .unwrap();
+                assert_eq!(byte, *b"x");
+                assert_eq!(
+                    packet.packet.credentials.process,
+                    KernelPidVisibility::Visible(NonZeroU32::new(std::process::id()).unwrap())
+                );
+                let descriptors: &[OwnedFd] = match &packet.rights {
+                    ReceivedPidfdRights::One(fd) => core::slice::from_ref(fd),
+                    ReceivedPidfdRights::Two(fds) => fds,
+                };
+                assert_eq!(descriptors.len(), count.count());
+                assert!(io::fcntl_getfd(&packet.packet.process)
+                    .unwrap()
+                    .contains(io::FdFlags::CLOEXEC));
+                assert!(descriptors
+                    .iter()
+                    .all(|fd| io::fcntl_getfd(fd).unwrap().contains(io::FdFlags::CLOEXEC)));
+                drop(packet);
+                for peer in peers {
+                    closed(peer);
+                }
+            }
+            for (count, payload) in [(1, &b"x"[..]), (3, &b"x"[..]), (2, &b"too-long"[..])] {
+                let (sender, receiver) = sockets().expect("capability changed after probe");
+                let mut peers = Vec::new();
+                let rights = (0..count)
+                    .map(|_| {
+                        let (fd, peer) = endpoint();
+                        peers.push(peer);
+                        fd
+                    })
+                    .collect::<Vec<_>>();
+                send_many(&sender, &rights, payload);
+                drop(rights);
+                let mut byte = [0];
+                assert!(recv_pidfd_rights_packet(
+                    &receiver,
+                    &mut [IoSliceMut::new(&mut byte)],
+                    PidfdRightsCount::Two
+                )
+                .is_err());
+                for peer in peers {
+                    closed(peer);
+                }
+            }
+            // Limit only the private test control storage to force a real
+            // kernel ancillary truncation, including installed rights cleanup.
+            let (sender, receiver) = sockets().expect("capability changed after probe");
+            let (right, peer) = endpoint();
+            send_many(&sender, &[right], b"x");
+            let mut control = KernelPidfdControl::new();
+            control.capacity_limit = crate::cmsg_space!(ScmCredentials(1), ScmRights(1));
+            let mut byte = [0];
+            let (bytes, flags) = backend::net::syscalls::recvmsg_pidfd(
+                receiver.as_fd(),
+                &mut [IoSliceMut::new(&mut byte)],
+                &mut control,
+                RecvFlags::DONTWAIT | RecvFlags::CMSG_CLOEXEC,
+            )
+            .unwrap();
+            assert!(flags.contains(ReturnFlags::CTRUNC));
+            assert!(matches!(
+                decode_rights_packet(bytes, flags, &mut control, PidfdRightsCount::One),
+                Err(RecvPidfdError::Truncated)
+            ));
+            drop(control);
+            closed(peer);
+
+            let (sender, receiver) = sockets().expect("capability changed after probe");
+            let (right, peer) = endpoint();
+            send_many(&sender, &[right], b"x");
+            let mut byte = [0];
+            assert!(matches!(
+                recv_pidfd_packet(&receiver, &mut [IoSliceMut::new(&mut byte)]),
+                Err(RecvPidfdError::UnexpectedAncillary)
+            ));
+            closed(peer);
+        }
+
+        #[test]
+        fn actual_owned_rights_and_refusal_cleanup_have_an_explicit_kernel_outcome() {
+            kernel_fixture(
+                "actual_owned_rights_and_refusal_cleanup_have_an_explicit_kernel_outcome",
+                "net::send_recv::pidfd::tests::rights::kernel_rights_child",
+                "RUSTIX_PIDFD_RIGHTS_CHILD",
+            );
+        }
+
+        #[test]
+        #[ignore = "isolated actual kernel fixture, invoked by the parent test"]
+        fn kernel_rights_child() {
+            assert_eq!(std::env::var("RUSTIX_PIDFD_RIGHTS_CHILD").unwrap(), "1");
+            let Some(probe) = sockets() else {
+                unsupported_fixture("kernel_rights_child");
+            };
+            drop(probe);
+            let census = || {
+                std::fs::read_dir("/proc/self/fd")
+                    .unwrap()
+                    .collect::<std::io::Result<Vec<_>>>()
+                    .unwrap()
+                    .len()
+            };
+            kernel_once();
+            synthetic_refusals_once();
+            let before = census();
+            for _ in 0..32 {
+                kernel_once();
+                synthetic_refusals_once();
+            }
+            assert_eq!(
+                census(),
+                before,
+                "rights-bearing receive/refusal leaked descriptors"
+            );
+        }
+
+        #[test]
+        fn actual_descriptor_zero_is_owned_in_the_separate_receiver() {
+            kernel_fixture(
+                "actual_descriptor_zero_is_owned_in_the_separate_receiver",
+                "net::send_recv::pidfd::tests::rights::descriptor_zero_rights_child",
+                "RUSTIX_PIDFD_RIGHTS_ZERO_CHILD",
+            );
+        }
+
+        #[test]
+        #[ignore = "isolated descriptor-zero fixture, invoked by the parent test"]
+        fn descriptor_zero_rights_child() {
+            assert_eq!(
+                std::env::var("RUSTIX_PIDFD_RIGHTS_ZERO_CHILD").unwrap(),
+                "1"
+            );
+            let Some((sender, receiver)) = sockets() else {
+                unsupported_fixture("descriptor_zero_rights_child");
+            };
+            let (right, peer) = endpoint();
+            send_many(&sender, &[right], b"x");
+            // SAFETY: This isolated child has null stdin and retains no owner
+            // for FD0. Only its own descriptor table is changed.
+            assert_eq!(unsafe { libc::close(0) }, 0);
+            let mut byte = [0];
+            let packet = recv_pidfd_rights_packet(
+                &receiver,
+                &mut [IoSliceMut::new(&mut byte)],
+                PidfdRightsCount::One,
+            )
+            .unwrap();
+            let ReceivedPidfdRights::One(right) = packet.rights else {
+                unreachable!()
+            };
+            assert!(packet.packet.process.as_raw_fd() == 0 || right.as_raw_fd() == 0);
+            drop(right);
+            drop(packet.packet);
+            closed(peer);
+        }
     }
 }
