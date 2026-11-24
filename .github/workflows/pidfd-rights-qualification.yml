@@ -1,0 +1,124 @@
+name: PIDFD rights Linux qualification
+"on":
+  push:
+    branches: [codex/pidfd-rights-linux-qualification-20261124]
+permissions:
+  contents: read
+concurrency:
+  group: pidfd-rights-qualification-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  kernel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: linux_raw
+            features: all-apis
+          - backend: libc
+            features: all-apis,use-libc
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/rustix-target
+      EVIDENCE: ${{ runner.temp }}/pidfd-evidence
+    defaults:
+      run:
+        shell: bash
+        working-directory: candidate
+    steps:
+      - name: Check out only the qualification inputs
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: qualification
+          persist-credentials: false
+      - name: Check out the full exact reviewed candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: a7834e0edace258dc42f344f2401a2d21349460f
+          path: candidate
+          persist-credentials: false
+      - name: Bind source, toolchain and resolved build inputs
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = a7834e0edace258dc42f344f2401a2d21349460f
+          git diff --exit-code
+          mkdir -m 700 "$EVIDENCE"
+          git rev-parse HEAD HEAD^{tree} > "$EVIDENCE/source.txt"
+          git ls-files -z | xargs -0 sha256sum > "$EVIDENCE/tracked-source.txt"
+          uname -srvm > "$EVIDENCE/kernel.txt"
+          rustup toolchain install 1.100.0 --profile minimal
+          rustc +1.100.0 --version --verbose > "$EVIDENCE/rustc.txt"
+          printf '%s  %s\n' 'd00962db20ccd0dc5cbc055d80ade847267f74f3bc6bd363a5f229b02c7a1f87' "$GITHUB_WORKSPACE/qualification/qualification.lock" | sha256sum --check
+          cp "$GITHUB_WORKSPACE/qualification/qualification.lock" Cargo.lock
+          cp Cargo.lock "$EVIDENCE/Cargo.lock"
+          cargo +1.100.0 metadata --locked --no-deps --format-version 1 --features '${{ matrix.features }}' > "$EVIDENCE/cargo-metadata.json"
+      - name: Run the complete actual packet module and require real kernel PASS
+        run: |
+          set -euo pipefail
+          set +e
+          cargo +1.100.0 test --locked --lib --features '${{ matrix.features }}' net::send_recv::pidfd::tests:: -- --nocapture --test-threads=1 2>&1 | sed -E '/--client_env=|[A-Za-z_][A-Za-z0-9_]*=|process didn.t exit successfully/d' | tee "$EVIDENCE/module.log"
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          printf '%s\n' "${statuses[*]}" > "$EVIDENCE/module-exits.txt"
+          test "${statuses[*]}" = '0 0 0'
+          grep -F 'test result: ok. 19 passed; 0 failed; 5 ignored;' "$EVIDENCE/module.log"
+          sed -n 's/.*RUSTIX_PIDFD_KERNEL \(.*\)/\1/p' "$EVIDENCE/module.log" | sort > "$EVIDENCE/kernel-outcomes.txt"
+          printf '%s\n' \
+            'actual_kernel_packet_is_owned_and_cloexec PASS' \
+            'actual_unexpected_rights_and_payload_truncation_close_received_rights PASS' \
+            'actual_ancillary_truncation_closes_already_delivered_rights PASS' \
+            'actual_descriptor_zero_is_distinct_from_credential_pid_zero PASS' \
+            'actual_isolated_socket_cleanup_and_repeated_descriptor_census PASS' \
+            'actual_owned_rights_and_refusal_cleanup_have_an_explicit_kernel_outcome PASS' \
+            'actual_descriptor_zero_is_owned_in_the_separate_receiver PASS' | sort > "$EVIDENCE/expected-kernel-outcomes.txt"
+          cmp "$EVIDENCE/kernel-outcomes.txt" "$EVIDENCE/expected-kernel-outcomes.txt"
+      - name: Execute each isolated child explicitly and reject zero selection
+        run: |
+          set -euo pipefail
+          for pair in \
+            'descriptor_zero_child|RUSTIX_PIDFD_DESCRIPTOR_ZERO_CHILD' \
+            'synthetic_failure_controls_child|RUSTIX_PIDFD_SYNTHETIC_FAILURE_CONTROLS_CHILD' \
+            'kernel_cleanup_child|RUSTIX_PIDFD_KERNEL_CLEANUP_CHILD' \
+            'rights::kernel_rights_child|RUSTIX_PIDFD_RIGHTS_CHILD' \
+            'rights::descriptor_zero_rights_child|RUSTIX_PIDFD_RIGHTS_ZERO_CHILD'; do
+            case_name="${pair%%|*}"
+            variable="${pair##*|}"
+            log="$EVIDENCE/child-${variable}.log"
+            set +e
+            env "$variable=1" cargo +1.100.0 test --locked --lib --features '${{ matrix.features }}' "net::send_recv::pidfd::tests::$case_name" -- --exact --ignored --nocapture --test-threads=1 2>&1 | sed -E '/--client_env=|[A-Za-z_][A-Za-z0-9_]*=|process didn.t exit successfully/d' | tee "$log"
+            statuses=("${PIPESTATUS[@]}")
+            set -e
+            printf '%s\n' "${statuses[*]}" > "$log.exits"
+            test "${statuses[*]}" = '0 0 0'
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$log"
+          done
+      - name: Bind the actual selected backend
+        if: always()
+        run: |
+          set -euo pipefail
+          outputs=("$CARGO_TARGET_DIR"/debug/build/rustix-*/output)
+          test "${#outputs[@]}" -eq 1
+          grep -E '^cargo:rustc-cfg=(linux_raw|libc)$' "${outputs[0]}" > "$EVIDENCE/backend.txt"
+          printf 'cargo:rustc-cfg=%s\n' '${{ matrix.backend }}' > "$EVIDENCE/expected-backend.txt"
+          cmp "$EVIDENCE/backend.txt" "$EVIDENCE/expected-backend.txt"
+          git diff --exit-code
+      - name: Bound the retained evidence
+        id: bounded
+        if: always()
+        run: |
+          set -euo pipefail
+          for file in "$EVIDENCE"/*; do
+            test -f "$file"
+            test "$(wc -c < "$file")" -le 2097152
+          done
+          printf 'safe=true\n' >> "$GITHUB_OUTPUT"
+      - name: Retain the exact source and kernel outcomes, including failures
+        if: ${{ always() && steps.bounded.outputs.safe == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: pidfd-rights-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pidfd-evidence
+          if-no-files-found: error
+          retention-days: 14
