@@ -1818,3 +1818,19 @@ mod tests {
         static_assertions::assert_eq_size!(Timeout, c_int);
     }
 }
+
+/// Enable kernel process-handle ancillary data on received Linux Unix packets.
+#[cfg(target_os = "linux")]
+#[inline]
+#[doc(alias = "SO_PASSPIDFD")]
+pub fn set_socket_passpidfd<Fd: AsFd>(fd: Fd, enabled: bool) -> io::Result<()> {
+    backend::net::sockopt::set_socket_passpidfd(fd.as_fd(), enabled)
+}
+
+/// Read whether Linux process-handle ancillary reception is enabled.
+#[cfg(target_os = "linux")]
+#[inline]
+#[doc(alias = "SO_PASSPIDFD")]
+pub fn socket_passpidfd<Fd: AsFd>(fd: Fd) -> io::Result<bool> {
+    backend::net::sockopt::socket_passpidfd(fd.as_fd())
+}

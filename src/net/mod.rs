@@ -24,6 +24,8 @@ pub mod sockopt;
 pub use crate::maybe_polyfill::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6,
 };
+#[cfg(target_os = "linux")]
+pub(crate) use send_recv::KernelPidfdControl;
 pub use send_recv::*;
 pub use socket::*;
 pub use socket_addr_any::SocketAddrAny;

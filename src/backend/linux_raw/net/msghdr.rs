@@ -123,3 +123,30 @@ pub(crate) fn zero_msghdr() -> c::msghdr {
         msg_flags: 0,
     }
 }
+
+/// Kernel-owned receive storage for the strict Linux PIDFD packet operation.
+///
+/// # Safety
+/// The callback must obey every pointer/length bound. On Ok it must have
+/// initialized msg_controllen bytes of kernel CMSG data with the corresponding
+/// installed descriptor ownership. Err must not leave installed descriptors.
+#[cfg(target_os = "linux")]
+pub(crate) unsafe fn with_recv_pidfd_msghdr<R>(
+    iov: &mut [IoSliceMut<'_>],
+    control: &mut crate::net::KernelPidfdControl,
+    f: impl FnOnce(&mut c::msghdr) -> io::Result<R>,
+) -> io::Result<R> {
+    let mut header = zero_msghdr();
+    header.msg_iov = iov.as_mut_ptr().cast();
+    header.msg_iovlen = msg_iov_len(iov.len());
+    header.msg_control = control.pointer().cast();
+    header.msg_controllen = msg_control_len(control.capacity());
+    let result = f(&mut header);
+    if result.is_ok() {
+        // SAFETY: The callback's successful-receive contract establishes the
+        // bounded initialized range and installed FD ownership. This is done
+        // before any parsing or address conversion. No old ancillary Drop runs.
+        control.received(header.msg_controllen as usize);
+    }
+    result
+}

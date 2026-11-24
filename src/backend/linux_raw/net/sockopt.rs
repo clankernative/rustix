@@ -1171,3 +1171,15 @@ fn duration_to_secs<T: TryFrom<u64>>(duration: Duration) -> io::Result<T> {
     }
     T::try_from(secs).map_err(|_e| io::Errno::INVAL)
 }
+
+#[cfg(target_os = "linux")]
+#[inline]
+pub(crate) fn set_socket_passpidfd(fd: BorrowedFd<'_>, enabled: bool) -> io::Result<()> {
+    setsockopt(fd, c::SOL_SOCKET, c::SO_PASSPIDFD, from_bool(enabled))
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+pub(crate) fn socket_passpidfd(fd: BorrowedFd<'_>) -> io::Result<bool> {
+    getsockopt(fd, c::SOL_SOCKET, c::SO_PASSPIDFD).map(to_bool)
+}
