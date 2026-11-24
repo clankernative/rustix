@@ -20,8 +20,8 @@ jobs:
           - backend: libc
             features: all-apis,use-libc
     env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/rustix-target
-      EVIDENCE: ${{ runner.temp }}/pidfd-evidence
+      CARGO_TARGET_DIR: /tmp/day2-rustix-pidfd-target
+      EVIDENCE: /tmp/day2-rustix-pidfd-evidence
     defaults:
       run:
         shell: bash
@@ -44,6 +44,7 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = a7834e0edace258dc42f344f2401a2d21349460f
           git diff --exit-code
+          test ! -e "$CARGO_TARGET_DIR"
           mkdir -m 700 "$EVIDENCE"
           git rev-parse HEAD HEAD^{tree} > "$EVIDENCE/source.txt"
           git ls-files -z | xargs -0 sha256sum > "$EVIDENCE/tracked-source.txt"
@@ -126,6 +127,6 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: pidfd-rights-${{ matrix.backend }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/pidfd-evidence
+          path: /tmp/day2-rustix-pidfd-evidence
           if-no-files-found: error
           retention-days: 14
