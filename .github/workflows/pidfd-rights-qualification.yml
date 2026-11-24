@@ -46,7 +46,7 @@ jobs:
           git diff --exit-code
           test ! -e "$CARGO_TARGET_DIR"
           mkdir -m 700 "$EVIDENCE"
-          git rev-parse HEAD HEAD^{tree} > "$EVIDENCE/source.txt"
+          git rev-parse HEAD 'HEAD^{tree}' > "$EVIDENCE/source.txt"
           git ls-files -z | xargs -0 sha256sum > "$EVIDENCE/tracked-source.txt"
           uname -srvm > "$EVIDENCE/kernel.txt"
           rustup toolchain install 1.100.0 --profile minimal
