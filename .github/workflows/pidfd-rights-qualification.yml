@@ -58,11 +58,20 @@ jobs:
         run: |
           set -euo pipefail
           set +e
-          cargo +1.100.0 test --locked --lib --features '${{ matrix.features }}' net::send_recv::pidfd::tests:: -- --nocapture --test-threads=1 2>&1 | sed -E '/--client_env=|[A-Za-z_][A-Za-z0-9_]*=|process didn.t exit successfully/d' | tee "$EVIDENCE/module.log"
+          root_id="$(jq -r --arg manifest "$PWD/Cargo.toml" '.packages[] | select(.manifest_path == $manifest) | .id' "$EVIDENCE/cargo-metadata.json")"
+          test -n "$root_id"
+          printf '%s\n' "$root_id" > "$EVIDENCE/local-package-id.txt"
+          cargo +1.100.0 test --locked --lib --package rustix@1.1.5 --message-format=json-render-diagnostics --features '${{ matrix.features }}' net::send_recv::pidfd::tests:: -- --nocapture --test-threads=1 2>&1 | jq -Rr --arg package "$root_id" '
+            (fromjson? // .) | if type == "object" then
+              if .reason == "build-script-executed" and .package_id == $package then
+                .cfgs[] | select(. == "linux_raw" or . == "libc") | "RUSTIX_SELECTED_BACKEND " + .
+              elif .reason == "compiler-message" then .message.rendered // empty
+              else empty end
+            else . end' | sed -E '/--client_env=|[A-Za-z_][A-Za-z0-9_]*=|process didn.t exit successfully/d' | tee "$EVIDENCE/module.log"
           statuses=("${PIPESTATUS[@]}")
           set -e
           printf '%s\n' "${statuses[*]}" > "$EVIDENCE/module-exits.txt"
-          test "${statuses[*]}" = '0 0 0'
+          test "${statuses[*]}" = '0 0 0 0'
           grep -F 'test result: ok. 19 passed; 0 failed; 5 ignored;' "$EVIDENCE/module.log"
           sed -n 's/.*RUSTIX_PIDFD_KERNEL \(.*\)/\1/p' "$EVIDENCE/module.log" | sort > "$EVIDENCE/kernel-outcomes.txt"
           printf '%s\n' \
@@ -87,7 +96,7 @@ jobs:
             variable="${pair##*|}"
             log="$EVIDENCE/child-${variable}.log"
             set +e
-            env "$variable=1" cargo +1.100.0 test --locked --lib --features '${{ matrix.features }}' "net::send_recv::pidfd::tests::$case_name" -- --exact --ignored --nocapture --test-threads=1 2>&1 | sed -E '/--client_env=|[A-Za-z_][A-Za-z0-9_]*=|process didn.t exit successfully/d' | tee "$log"
+            env "$variable=1" cargo +1.100.0 test --locked --lib --package rustix@1.1.5 --features '${{ matrix.features }}' "net::send_recv::pidfd::tests::$case_name" -- --exact --ignored --nocapture --test-threads=1 2>&1 | sed -E '/--client_env=|[A-Za-z_][A-Za-z0-9_]*=|process didn.t exit successfully/d' | tee "$log"
             statuses=("${PIPESTATUS[@]}")
             set -e
             printf '%s\n' "${statuses[*]}" > "$log.exits"
@@ -98,10 +107,8 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          outputs=("$CARGO_TARGET_DIR"/debug/build/rustix-*/output)
-          test "${#outputs[@]}" -eq 1
-          grep -E '^cargo:rustc-cfg=(linux_raw|libc)$' "${outputs[0]}" > "$EVIDENCE/backend.txt"
-          printf 'cargo:rustc-cfg=%s\n' '${{ matrix.backend }}' > "$EVIDENCE/expected-backend.txt"
+          grep -E '^RUSTIX_SELECTED_BACKEND (linux_raw|libc)$' "$EVIDENCE/module.log" > "$EVIDENCE/backend.txt"
+          printf 'RUSTIX_SELECTED_BACKEND %s\n' '${{ matrix.backend }}' > "$EVIDENCE/expected-backend.txt"
           cmp "$EVIDENCE/backend.txt" "$EVIDENCE/expected-backend.txt"
           git diff --exit-code
       - name: Bound the retained evidence
